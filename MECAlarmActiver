@@ -1,0 +1,879 @@
+#pragma once
+
+#include <MECTelegramStructure.h>
+#include <MisOracleDbUty.h>
+#include <BhsOraCheck.h>
+#include "BhsTcpClient.h"
+
+using namespace BHS::MessageQueue;
+using namespace BHS::Common::EventLog;
+using namespace BHS::Common::TelegramUty;
+
+using namespace System;
+using namespace System::Collections;
+using namespace System::Collections::Specialized;
+using namespace System::Configuration;
+using namespace System::Data;
+using namespace System::Diagnostics;
+using namespace System::Drawing;
+using namespace System::Globalization;
+using namespace System::IO;
+using namespace System::Net;
+using namespace System::Net::Sockets;
+using namespace System::Threading;
+using namespace System::Timers;
+using namespace System::Windows::Forms;
+
+#define REPEAT_MAX	1
+
+namespace MEC
+{
+	public ref class MECAlarmActiver : public System::Windows::Forms::Form
+	{	
+		private: System::Windows::Forms::ContextMenu^	contextMenu;
+		private: System::Windows::Forms::MenuItem	^	menuExit;
+		private: System::Windows::Forms::NotifyIcon ^	notifyIcon;
+		private: System::ComponentModel::IContainer	^	components;
+
+		private: void InitializeComponent(void)
+			{
+				this->components = gcnew System::ComponentModel::Container();
+				this->contextMenu = gcnew System::Windows::Forms::ContextMenu();
+				this->menuExit = gcnew System::Windows::Forms::MenuItem();
+				this->notifyIcon = gcnew System::Windows::Forms::NotifyIcon(this->components);
+				// 
+				// contextMenu
+				// 
+				//System::Windows::Forms::MenuItem^ __mcTemp__1[] = new System::Windows::Forms::MenuItem^[1];
+				System::Windows::Forms::MenuItem^ __mcTemp__1[] = new System::Windows::Forms::MenuItem^[1];
+				__mcTemp__1[0] = this->menuExit;
+				this->contextMenu->MenuItems->AddRange(__mcTemp__1);
+				// 
+				// menuExit
+				// 
+				this->menuExit->Index = 0;
+				this->menuExit->Text = "Exit";
+				this->menuExit->Click += gcnew System::EventHandler(this, OnExit_Click);
+				// 
+				// notifyIcon
+				// 
+				this->notifyIcon->ContextMenu = this->contextMenu;
+				this->notifyIcon->Text = "MECAlarmActiver - Run";
+				this->notifyIcon->Visible = true;
+				// 
+				// MECAlarmActiver
+				// 
+				this->AutoScaleBaseSize = System::Drawing::Size(5, 13);
+				this->ClientSize = System::Drawing::Size(112, 76);
+				this->ControlBox = false;
+				this->FormBorderStyle = System::Windows::Forms::FormBorderStyle::None;
+				this->Name = "MECAlarmActiver";
+				this->Opacity = 0;
+				this->ShowInTaskbar = false;
+				this->WindowState = System::Windows::Forms::FormWindowState::Minimized;
+				this->Closing += gcnew System::ComponentModel::CancelEventHandler(this, MECAlarmActiver_Closing);
+				this->Load += gcnew System::EventHandler(this, MECAlarmActiver_Load);
+
+			}
+
+
+		//--------------------------------------------------------------------
+		//Attribute
+		private: String^	m_sMECNo;
+		private: String^	m_sProcess;
+		private: String^	m_sFilePath;
+
+		private: String^	m_sAEIFLogFile;
+		private: String^	m_sAEMsgFile;
+		private: String^	m_sRefTelegramNo;
+		//--------------------------------------------------------------------
+		//Connection to MIS
+		private: BhsTcpClient^	m_tcpClient1;
+		private: BhsTcpClient^	m_tcpClient2;
+		
+		private: String^	m_sIp1;
+		private: String^	m_sIp2;
+		private: int		m_nPort1;
+		private: int		m_nPort2;
+		//--------------------------------------------------------------------
+		//Connection parameters
+		private: int		m_nKeepAlive;
+		private: int		m_nTimeOut;
+		private: int		m_nReconnection;
+		//--------------------------------------------------------------------
+		//Message queue
+		private: System::Messaging::MessageQueue^	m_mqMain;
+		private: String^	m_sMQServerName;
+		//--------------------------------------------------------------------
+		private: Thread^	m_thread;
+		//--------------------------------------------------------------------
+		private: log4net::ILog^	m_log;
+		//--------------------------------------------------------------------
+		private: bool		m_bRunning;
+		//--------------------------------------------------------------------
+		private: BhsUty::BhsOracleDbUty^ oracleDbReader;
+		private: String^	m_sOracleConnectString;
+		//--------------------------------------------------------------------
+		private: String^	m_sDbLog;
+		//--------------------------------------------------------------------
+		public:
+			MECAlarmActiver(void)
+			{
+				InitializeComponent();
+				//--------------------------------------------------------------------
+				if( CheckProcessExist())
+				{
+                    exit(0);
+				}
+				//--------------------------------------------------------------------
+				// The Icon property sets the icon to appear in the systray
+				this->notifyIcon->Icon = gcnew System::Drawing::Icon("app.ico");
+				//--------------------------------------------------------------------
+			}
+  
+		protected:
+			//void Dispose(Boolean disposing)
+			MECAlarmActiver()
+			{
+				if (disposing && components)
+				{
+					components->Dispose();			 
+				}
+				__super::Dispose(disposing);
+			}	
+		//--------------------------------------------------------------------
+		private: System::Void MECAlarmActiver_Load(System::Object ^  sender, System::EventArgs ^ e)
+		{
+			try
+			{
+				GetSystemConfig();
+				BHSTelegramUty::InitialTelegramNo();
+				//------------------------------------------------------------
+				m_log = log4net::LogManager::GetLogger( "MECAlarmActiver");
+				//------------------------------------------------------------
+				m_mqMain				= gcnew System::Messaging::MessageQueue();
+				m_mqMain->Path			= m_sMQServerName;
+				m_mqMain->Formatter		= gcnew System::Messaging::ActiveXMessageFormatter();
+				//------------------------------------------------------------
+				//oracleDbReader = new BhsUty::BhsOracleDbUty(m_sOracleConnectString);
+				oracleDbReader = new BhsUty::BhsOracleDbUty(m_sOracleConnectString);
+				oracleDbReader->OpenConnection();
+
+				if(oracleDbReader->Connected)
+				{
+					BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+						"< MECAlarmActiver_Load - INFO >",
+						"Success to connect to database ");
+					//------------------------------------------------------------
+					ProcessOfflineLog();
+				}
+				else
+				{
+					BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+						"< MECAlarmActiver_Load - WARNING >",
+						"Fail to connect to database ");
+				}
+				//------------------------------------------------------------
+				m_tcpClient1			= gcnew MEC::BhsTcpClient(m_sIp1,m_nPort1);
+				m_tcpClient1->ILog		= m_log;
+				m_tcpClient1->BhsLogFilePath	= m_sFilePath;
+				m_tcpClient1->BhsLogHeader		= "Socket1";
+
+				m_tcpClient1->KeepAliveInterval	= m_nKeepAlive;
+				m_tcpClient1->Timeout			= m_nTimeOut;
+				m_tcpClient1->ReconnectInterval	= m_nReconnection;
+
+				m_tcpClient1->From		= "MEC";
+				m_tcpClient1->To		= "MIS";
+
+				m_tcpClient1->Start();
+				//------------------------------------------------------------
+				m_tcpClient2			= gcnew MEC::BhsTcpClient(m_sIp2,m_nPort2);
+				m_tcpClient2->ILog		= m_log;
+				m_tcpClient2->BhsLogFilePath	= m_sFilePath;
+				m_tcpClient2->BhsLogHeader		= "Socket2";
+
+				m_tcpClient2->KeepAliveInterval	= m_nKeepAlive;
+				m_tcpClient2->Timeout			= m_nTimeOut;
+				m_tcpClient2->ReconnectInterval	= m_nReconnection;
+
+				m_tcpClient2->From		= "MEC";
+				m_tcpClient2->To		= "MIS";
+
+				m_tcpClient2->Start();
+				//------------------------------------------------------------
+				m_bRunning	= true;
+				m_thread	= gcnew Thread(gcnew ThreadStart(this,&MECAlarmActiver::OnRecvMQ));
+				m_thread->Start();
+				//------------------------------------------------------------
+				
+				m_log->Info("AlarmActiver has been started completely.");
+				BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+					"MECAlarmActiver_Load - INFO",
+					"AlarmActiver has been started completely.");
+				
+			}
+			catch(Exception ^ e)
+			{			
+				m_log->Error(String::Concat("< FUNCTION MECAlarmActiver::MECAlarmActiver_Load >\n",e->Message));
+				BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+					"< MECAlarmActiver_Load - ERROR >",
+					e->Message);
+			}
+		}
+				 
+		//--------------------------------------------------------------------
+		void OnRecvMQ()
+		{
+			try
+			{
+				System::Messaging::Message^ myMessage;
+				String^						msg;
+				
+				int		nRepeatCount;
+				bool	bRepeat;
+
+				int		nModified;
+				
+				nRepeatCount	= 0;
+				bRepeat			= false;
+
+				String^ sReceiveData;
+				bool	bResult1;
+				bool	bResult2;
+				int		nTelegramLength;
+
+				MEC::Telegram::Header^ header;
+				MEC::Telegram::Header^ header2;
+				
+				while(m_bRunning)
+				{
+					try
+					{
+						if(!bRepeat || nRepeatCount > REPEAT_MAX)
+						{
+							//------------------------------------------------------------
+							bRepeat			= false;
+							nRepeatCount	= 0;
+							//------------------------------------------------------------
+							//Wait for telegram from message queue
+							try
+							{
+								m_log->Debug("Try to receive message from message queue");
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - INFO >",
+									"Try to receive message from message queue");
+
+								myMessage = m_mqMain->Receive(TimeSpan(0,0,30));
+							}
+							catch(System::Messaging::MessageQueueException^ mqe)
+							{
+								if(mqe->MessageQueueErrorCode == System::Messaging::MessageQueueErrorCode::IOTimeout)
+								{	//Timeout
+									m_log->Debug("Receive message queue timeout");
+									BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - INFO >",
+										"Receive message queue timeout");
+									continue;
+								}
+								else
+								{
+									throw(mqe);
+								}
+							}
+							msg = dynamic_cast<String^>(myMessage->Body);
+							//------------------------------------------------------------
+							//check telegram format (only telegram length)
+							header	= gcnew MEC::Telegram::Header();
+							header->Parse(msg);
+							nTelegramLength = Convert::ToInt32(header->sLength);
+							if( nTelegramLength != msg->Length - MEC::Telegram::Header::SizeOfHeaderPart())
+							{
+								String^ sTmp = String::Format("Telegram length error.\nTelegram data length is {0} chars but receive {1} char(s).",
+																nTelegramLength.ToString(),
+																(msg->Length - MEC::Telegram::Header::SizeOfHeaderPart()).ToString());
+								m_log->Warn(sTmp);
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - WARNING >",
+										sTmp);
+								continue;
+							}
+							//------------------------------------------------------------
+							m_log->Info(String::Concat("Receive telegram from message queue: ",msg));
+							BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+														"< OnRecvMQ - INFO >",
+														String::Concat("Receive telegram from message queue: ",msg));
+							//------------------------------------------------------------
+							//Update database every time that receive new telegram from database
+							if( header->IsSendTo(TO_MIS) && header->CheckTelegramID("AEIF"))
+							{
+								//nModified = UpdateToDatabase(msg);
+								nModified = UpdateToDatabase(msg);
+								if(nModified == 0)	//Can update into database but there is no change
+								{
+									BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - INFO >",
+										"Status of alarm doesn't change so it doesn't need to send to MIS ");
+									continue;
+								}
+							}
+						}
+						//------------------------------------------------------------
+				        //------------------------------------------------------------
+						if( header->IsSendTo(TO_MIS) && header->CheckTelegramID("AEIF"))
+						{
+							//------------------------------------------------------------
+							//Send to host1
+							
+							m_log->Info("Try to send telegram to host1");
+							BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+								"< OnRecvMQ - INFO >",
+								String::Format("Try to send telegram to host1. Message: {0}", msg));
+							
+							bResult1 = m_tcpClient1->SendStream(msg);
+							if(bResult1)
+							{
+								//bResult1 = m_tcpClient1->ReceiveStream(&sReceiveData);
+								bResult1 = m_tcpClient1->ReceiveStream(&sReceiveData);
+								if(!bResult1)
+								{
+									
+									m_log->Warn("Can not receive response telegram from MIS1 due to communication problem");
+									BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - WARNING >",
+										"Can not receive response telegram from MIS1 due to communication problem");
+								}
+							}
+							else
+							{
+								
+								m_log->Warn("Can not send telegram to MIS1 due to communication problem");
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - WARNING >",
+									"Can not send telegram to MIS1 due to communication problem");
+							}
+
+							if(bResult1)
+							{
+								m_log->Info(String::Concat("Received response telegram from MIS1: ",sReceiveData));
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - INFO >",
+									String::Format("Received response telegram from MIS1: {0}", sReceiveData));
+								//Check response code in response telegram
+								header2 = gcnew MEC::Telegram::Header();
+								header2->Parse(sReceiveData);
+
+								//------------------------------------------------------------
+								if(!header2->sResultCode->Equals("000"))
+								{
+									m_log->Warn("Received negative response from MIS1");
+									BHSTelegramUty::WriteLogFile(m_sFilePath,"Log",
+										"< OnRecvMQ - WARNING >",
+										"Received negative response from MIS1");
+									bResult1 = false;
+								}
+							}
+							//------------------------------------------------------------
+							//------------------------------------------------------------
+							//Send to host2
+							m_log->Info("Try to send telegram to host2");
+							BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+								"< OnRecvMQ - INFO >",
+								String::Format("Try to send telegram to host2. Message: {0}", msg));
+		
+							bResult2 = m_tcpClient2->SendStream(msg);
+							if(bResult2)
+							{
+								bResult2 = m_tcpClient2->ReceiveStream(&sReceiveData);
+								if(!bResult2)
+								{
+									m_log->Warn("Can not receive response telegram from MIS2 due to communication problem");
+									BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - WARNING >",
+										"Can not receive response telegram from MIS2 due to communication problem");
+								}
+							}
+							else
+							{
+								m_log->Warn("Can not send telegram to MIS2 due to communication problem");
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - WARNING >",
+									"Can not send telegram to MIS2 due to communication problem");
+							}
+
+							if(bResult2)
+							{
+								m_log->Info(String::Concat("Received response telegram from MIS2: ",sReceiveData));
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - INFO >",
+									String::Format("Received response telegram from MIS2: {0}", sReceiveData));
+								//Check response code in response telegram
+								header2 = gcnew MEC::Telegram::Header();
+								header2->Parse(sReceiveData);
+
+								//------------------------------------------------------------
+								if(!header2->sResultCode->Equals("000"))
+								{
+									m_log->Warn("Received negative response from MIS2");
+									BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+										"< OnRecvMQ - WARNING >",
+										"Received negative response from MIS2");
+									bResult2 = false;
+								}
+							}
+							//------------------------------------------------------------
+							if(bResult1 && bResult2)
+							{
+								bRepeat	= true;
+								nRepeatCount++;
+
+								BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+									"< OnRecvMQ - INFO >",
+									String::Concat("Repeat count = ",nRepeatCount.ToString()));
+							}
+							else
+							{
+								bRepeat			= false;
+								nRepeatCount	= 0;
+							}
+							//------------------------------------------------------------
+						}
+						else
+						{	
+							m_log->Warn(String::Concat("OnRecvMQ - Unknown Message: ",msg));
+							BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+								"< OnRecvMQ - WARNING >",
+								String::Concat("OnRecvMQ - Unknown Message: ",msg));
+							//------------------------------------------------------------
+							bRepeat			= false;
+							nRepeatCount	= 0;
+						}
+					}
+					catch(Exception^ e)
+					{	//Write EventLog
+						m_log->Warn(String::Concat("OnRecvMQ - Exception: ",e->Message));
+						BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+							"< OnRecvMQ - ERROR >",
+							String::Concat("Exception: ",e->Message));
+					}
+				}
+			}
+			catch(Exception^ e)
+			{	//Write EventLog
+				m_log->Warn(String::Concat("OnRecvMQ - Exception: ",e->Message));
+				BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+					"< OnRecvMQ - ERROR >",
+					String::Concat("Exception: ",e->Message));
+			}
+		}
+		//--------------------------------------------------------------------
+		/// UpdateToDatabase
+		/// Update alarm into database
+		/// 0: Alarm status doesn't change so nothing in database is updated
+		/// 1: Alarm status changed and data in database is updated
+		/// 2: Error. Cann't connect to database.
+		private: int UpdateToDatabase(String^ sMsg)
+		{
+			try
+			{
+				MEC::Telegram::AE_INFO^ telegram	= gcnew MEC::Telegram::AE_INFO();
+				telegram->Parse(sMsg,0);
+
+				BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+					"< UpdateToDatabase - INFO >",
+					"Call stored procedure to update alarm/event information into database");
+				
+				if(!oracleDbReader->Connected)
+				{
+					oracleDbReader = new BhsUty::BhsOracleDbUty(m_sOracleConnectString);
+					oracleDbReader->OpenConnection();
+
+					if(oracleDbReader->Connected)
+					{
+						ProcessOfflineLog();
+					}
+					else
+					{
+						//Write to log file
+						WriteOfflineLog(sMsg);
+						return 2;
+					}
+				}
+				
+				StringBuilder^	sbCommand	= gcnew StringBuilder();
+				sbCommand->Append("begin BHS_ALARM_PKG.BHS_ALARMEVENT_INPUT(");
+				//Input
+				sbCommand->Append(":pAeTime,");
+				sbCommand->Append(":pAeId,");
+				sbCommand->Append(":pAeType,");
+				sbCommand->Append(":pAeDescr,");
+				sbCommand->Append(":pIsClear,");
+				//Output
+				sbCommand->Append(":pModified,");
+				sbCommand->Append(":pRtnC,");
+				sbCommand->Append(":pErrMsg,");
+				sbCommand->Append(":pErrDetail);end;");
+				//Set connection string
+				oracleDbReader->SelectCommand = sbCommand->ToString();
+				//Input
+				oracleDbReader->AddInput("pAeTime",	OracleDbType::Char	,telegram->sAETime);
+				oracleDbReader->AddInput("pAeId",		OracleDbType::Char	,telegram->sAEID);
+				oracleDbReader->AddInput("pAeType",	OracleDbType::Char	,telegram->sAEType);
+				oracleDbReader->AddInput("pAeDescr",	OracleDbType::Char	,telegram->sMsgDescr);
+				oracleDbReader->AddInput("pIsClear",	OracleDbType::Char	,telegram->sOccurClear);
+				//Output
+				oracleDbReader->AddOutput("pModified",	OracleDbType::Int32);
+				oracleDbReader->AddOutput("pRtnC",		OracleDbType::Int32);
+				oracleDbReader->AddOutput("pErrMsg",	OracleDbType::Char	,255);
+				oracleDbReader->AddOutput("pErrDetail",OracleDbType::Char	,255);
+
+				/*
+				sbCommand->Append("begin BHS_MIS_PKG.BHS_ALARMEVENT_INPUT(");
+				//Input
+				sbCommand->Append(":pAeTime,");
+				sbCommand->Append(":pAeId,");
+				sbCommand->Append(":pAeType,");
+				sbCommand->Append(":pAeDescr,");
+				sbCommand->Append(":pIsClear,");
+				//Output
+				sbCommand->Append(":pRtnC,");
+				sbCommand->Append(":pErrMsg,");
+				sbCommand->Append(":pErrDetail);end;");
+				//Set connection string
+				oracleDbReader->SelectCommand = sbCommand->ToString();
+				//Input
+				oracleDbReader->AddInput(S"pAeTime",	OracleDbType::Char	,telegram->sAETime);
+				oracleDbReader->AddInput(S"pAeId",		OracleDbType::Char	,telegram->sAEID);
+				oracleDbReader->AddInput(S"pAeType",	OracleDbType::Char	,telegram->sAEType);
+				oracleDbReader->AddInput(S"pAeDescr",	OracleDbType::Char	,telegram->sMsgDescr);
+				oracleDbReader->AddInput(S"pIsClear",	OracleDbType::Char	,telegram->sOccurClear);
+				//Output
+				oracleDbReader->AddOutput(S"pRtnC",		OracleDbType::Int32);
+				oracleDbReader->AddOutput(S"pErrMsg",	OracleDbType::Char	,255);
+				oracleDbReader->AddOutput(S"pErrDetail",OracleDbType::Char	,255);
+				*/
+
+				try
+				{
+					oracleDbReader->ExecuteNonQuery();
+					int nRtnC	= Convert::ToInt32(oracleDbReader->GetParameterValue("pRtnC"));
+					if( nRtnC > 0)
+					{
+						//Generate alarm message
+						StringBuilder^ sbError	= gcnew StringBuilder();
+						sbError->Append("Detail: ");
+						if(oracleDbReader->GetParameterValue("pErrDetail")->ToString()->Trim()->Length>0)
+							sbError->Append(oracleDbReader->GetParameterValue("pErrDetail")->ToString()->Trim());
+						else
+							sbError->Append(oracleDbReader->GetParameterValue("pErrMsg")->ToString()->Trim());
+						//------------------------------------------------------------
+						m_log->Warn(sbError->ToString());
+						BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+							"< UpdateToDatabase - WARNING >",
+							sbError->ToString());
+						//------------------------------------------------------------
+						return 0;	// Although it is error but it doesn't communication error and there is no change in database so return 0
+					}
+					else
+					{
+						return Convert::ToInt32(oracleDbReader->GetParameterValue("pModified"));
+					}
+				}
+				catch(Exception^ e)
+				{
+					//Oracle exception
+					//Have to check exception id
+					//If related to communication then write to log file
+					//Canceled: If related to sepecific set of error, disconnect from db
+					m_log->Error(String::Concat("< UpdateDatabase - Exception >",e->Message));
+					BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+						"< UpdateToDatabase - ERROR >",
+						String::Concat("Exception: ",e->Message));
+
+					if(BhsUty::BhsOraCheck::IsCommErr(e->Message->Substring(0,9)))
+					{
+						//Write to log file
+						WriteOfflineLog(sMsg);
+						//If it is alarm which can not be updated into database
+						//This alarm should still send to MIS
+						//Because it may be able to update later
+						return 2;
+					}
+					else
+					{
+						//Error occurs because alarm
+						return 0; // Although it is error but it doesn't communication error and there is no change in database so return 0
+					}
+				}
+			}
+			catch(Exception^ e)
+			{	//Write EventLog
+				m_log->Warn(String::Concat("UpdateToDatabase - Exception: ",e->Message));
+				BHSTelegramUty::WriteLogFile(m_sFilePath, "Log",
+					"< UpdateToDatabase - ERROR >",
+					String::Concat("Exception: ",e->Message));
+				return 2;
+			}
+		}
+
+		//--------------------------------------------------------------------	
+		private: System::Void ProcessOfflineLog()
+		{
+			try
+			{
+				MEC::Telegram::AE_INFO^		AEIF;
+				StringBuilder^				sbCommand;
+
+				bool	bIsCommErr;		//true: database communication error
+				//bool	bIsNotFinish;	//true: communication error occurs before 
+
+				bIsCommErr		= false;
+				
+				//Try to open offline log
+				if(Monitor::TryEnter(m_sDbLog,1000)) //1 Seconds
+				{
+					try
+					{
+						//Check whether the offline log file is exist
+						if (File::Exists(m_sDbLog))
+						{
+							m_log->Info("Start to process offline log file.");
+							BHSTelegramUty::WriteLogFile(m_sFilePath,"Log",
+								"< ProcessOfflineLog - INFO >",
+								"Start to process offline log file.");
+							
+							//Read data from file and process one by one
+							StreamReader^	srOffline	= File::OpenText(m_sDbLog);
+							String^			sInput;
+
+							while((sInput = srOffline->ReadLine()) != NULL)
+							{
+								AEIF		= gcnew MEC::Telegram::AE_INFO();
+								AEIF->Parse(sInput,0);
+								sbCommand	= gcnew StringBuilder();
+
+								sbCommand->Append("begin BHS_ALARM_PKG.BHS_ALARMEVENT_INPUT(");
+								//Input
+								sbCommand->Append(":pAeTime,");
+								sbCommand->Append(":pAeId,");
+								sbCommand->Append(":pAeType,");
+								sbCommand->Append(":pAeDescr,");
+								sbCommand->Append(":pIsClear,");
+								//Output
+								sbCommand->Append(":pModified,");
+								sbCommand->Append(":pRtnC,");
+								sbCommand->Append(":pErrMsg,");
+								sbCommand->Append(":pErrDetail);end;");
+								//Set connection string
+								oracleDbReader->SelectCommand = sbCommand->ToString();
+								//Input
+								oracleDbReader->AddInput("pAeTime",	OracleDbType::Char	,AEIF->sAETime);
+								oracleDbReader->AddInput("pAeId",		OracleDbType::Char	,AEIF->sAEID);
+								oracleDbReader->AddInput("pAeType",	OracleDbType::Char	,AEIF->sAEType);
+								oracleDbReader->AddInput("pAeDescr",	OracleDbType::Char	,AEIF->sMsgDescr);
+								oracleDbReader->AddInput("pIsClear",	OracleDbType::Char	,AEIF->sOccurClear);
+								//Output
+								oracleDbReader->AddOutput("pModified",	OracleDbType::Int32);
+								oracleDbReader->AddOutput("pRtnC",		OracleDbType::Int32);
+								oracleDbReader->AddOutput("pErrMsg",	OracleDbType::Char	,255);
+								oracleDbReader->AddOutput("pErrDetail",OracleDbType::Char	,255);
+
+								/*
+								sbCommand->Append("begin BHS_MIS_PKG.BHS_ALARMEVENT_INPUT(");
+								//Input
+								sbCommand->Append(":pAeTime,");
+								sbCommand->Append(":pAeId,");
+								sbCommand->Append(":pAeType,");
+								sbCommand->Append(":pAeDescr,");
+								sbCommand->Append(":pIsClear,");
+								//Output
+								sbCommand->Append(":pRtnC,");
+								sbCommand->Append(":pErrMsg,");
+								sbCommand->Append(":pErrDetail);end;");
+								//Set connection string
+								oracleDbReader->SelectCommand = sbCommand->ToString();
+								//Input
+								oracleDbReader->AddInput(S"pAeTime",	OracleDbType::Char	,AEIF->sAETime);
+								oracleDbReader->AddInput(S"pAeId",		OracleDbType::Char	,AEIF->sAEID);
+								oracleDbReader->AddInput(S"pAeType",	OracleDbType::Char	,AEIF->sAEType);
+								oracleDbReader->AddInput(S"pAeDescr",	OracleDbType::Char	,AEIF->sMsgDescr);
+								oracleDbReader->AddInput(S"pIsClear",	OracleDbType::Char	,AEIF->sOccurClear);
+								//Output
+								oracleDbReader->AddOutput(S"pRtnC",		OracleDbType::Int32);
+								oracleDbReader->AddOutput(S"pErrMsg",	OracleDbType::Char	,255);
+								oracleDbReader->AddOutput(S"pErrDetail",OracleDbType::Char	,255);
+								*/
+								try
+								{
+									oracleDbReader->ExecuteNonQuery();
+								}
+								catch(Exception^ ex)
+								{
+									m_log->Error(String::Concat("< ProcessOfflineLog - Exception >",ex->Message));
+									if(BhsUty::BhsOraCheck::IsCommErr(ex->Message->Substring(0,9)))
+									{
+										bIsCommErr = true;
+										break;
+									}
+								}
+							}
+
+							//if communication error write to new file
+							if(bIsCommErr)
+							{
+								m_log->Info("Database communication problem has been detected. Writing remained data into temporary log file.");
+								//------------------------------------------------------------------
+								StreamWriter^	swOffline;
+								//Write last telegram that can not update into database
+								swOffline		= File::AppendText(String::Concat(m_sDbLog,".new"));
+								swOffline->WriteLine(AEIF->ToString());
+								//Copy the rest of file into new file
+								while((sInput = srOffline->ReadLine()) != NULL)
+								{
+									swOffline->WriteLine(sInput);
+								}
+								swOffline->Close();
+							}
+							else
+							{
+								m_log->Info("Finish to process offline log file.");
+							}
+							
+							//Close current log file
+							srOffline->Close();
+							//--------------------------------------------------------
+							//Delete current log file
+							m_log->Info("Deleting current offline log file.");
+							File::Delete(m_sDbLog);
+							//--------------------------------------------------------
+							if(File::Exists(String::Concat(m_sDbLog,".new")))
+							{	
+								//Rename new log file
+								File::Move(String::Concat(m_sDbLog,".new"),m_sDbLog);
+							}
+						}
+					}
+					catch(Exception^ ex)
+					{
+						m_log->Error(String::Concat("< ProcessOfflineLog - Exception >",ex->Message));
+					}
+					__finally
+					{
+						Monitor::Exit(m_sDbLog);
+					}
+				}
+			}
+			catch(Exception^ e)
+			{
+				m_log->Error(String::Concat("< ProcessOfflineLog - Exception >",e->Message));
+			}
+		}
+		//--------------------------------------------------------------------
+		private: System::Void WriteOfflineLog(String^ sMsg)
+		{
+			try
+			{
+				Monitor::Enter(m_sDbLog);
+				
+				BHSTelegramUty::WriteLogFile(m_sFilePath,"Log",
+					"< WriteOfflineLog - INFO >",
+					"Write alarm to offline log. ");
+
+				StreamWriter^	swOffline;
+				swOffline		= File::AppendText(m_sDbLog);
+				swOffline->WriteLine(sMsg);
+				swOffline->Close();
+			}
+			catch(Exception^ e)
+			{	//Write EventLog
+				m_log->Error(String::Concat("WriteOfflineLog - Exception: ",e->Message));
+				BHSTelegramUty::WriteLogFile(m_sFilePath,"Log",
+					"< WriteOfflineLog - ERROR >",
+					String::Concat("Exception: ",e->Message));
+			}
+			__finally
+			{
+				Monitor::Exit(m_sDbLog);
+			}
+		}
+		//--------------------------------------------------------------------
+		private: System::Void GetSystemConfig()
+		{
+			try
+			{
+				//Read configuration information for XML config file
+				NameValueCollection ^ valueConfig;
+				//Common parameters
+				valueConfig				= dynamic_cast<NameValueCollection^>(ConfigurationSettings::GetConfig("MECAlarmActiver"));
+				//m_sMECNo				= valueConfig->Item["MEC_NO"];
+				//m_sProcess				= valueConfig->Item["PROCESS_NAME"];
+				//m_sFilePath				= valueConfig->Item["FILEPATH"];
+				m_sMECNo				= valueConfig->Set["MEC_NO"];
+				m_sProcess				= valueConfig->Set["PROCESS_NAME"];
+				m_sFilePath				= valueConfig->Set["FILEPATH"];
+				//----------------------------------------------------------------------------
+				// all Set below was Item before
+				m_sMQServerName			= valueConfig->Set["MQ_SERVER"];
+				//----------------------------------------------------------------------------
+				m_nKeepAlive 			= Convert::ToInt32( valueConfig->Set["KPAL_INTERVAL"]);
+				m_nTimeOut				= Convert::ToInt32( valueConfig->Set["RECV_TIMEOUT"]);
+				m_nReconnection			= Convert::ToInt32( valueConfig->Set["RECONN_INTERVAL"]);
+				//----------------------------------------------------------------------------
+				m_sOracleConnectString	= valueConfig->Set["ORACLE_CONNECTSTRING"];
+				//----------------------------------------------------------------------------
+				m_sDbLog				= valueConfig->Set["DB_LOG"];
+				//----------------------------------------------------------------------------
+				//Connection parameters
+				valueConfig				= dynamic_cast<NameValueCollection^>(ConfigurationSettings::GetConfig("MIS_CONNECTION"));
+				m_sIp1					= valueConfig->Set["IP_ADDRESS1"];
+				m_sIp2					= valueConfig->Set["IP_ADDRESS2"];
+				m_nPort1				= Int32::Parse( valueConfig->Set["IP_PORT1"]);
+				m_nPort2				= Int32::Parse( valueConfig->Set["IP_PORT2"]);
+			}
+			catch(Exception ^)
+			{
+				MessageBox::Show("An error occures in the system configuration file. Please check this file and restart program again."
+								,"MECAlarmActiver"
+								,MessageBoxButtons::OK
+								,MessageBoxIcon::Error );
+				exit(0);
+			}
+		}
+		//----------------------------------------------------------
+		private: System::Void OnExit_Click(Object^ Sender, EventArgs^ e) 	 
+		{
+			this->Close();
+		}
+		
+		//----------------------------------------------------------
+		private: System::Void MECAlarmActiver_Closing(System::Object ^  sender, System::ComponentModel::CancelEventArgs ^  e)
+		{
+			m_bRunning = false;
+
+			m_tcpClient1->Stop();
+			m_tcpClient2->Stop();
+			
+			m_mqMain->Close();
+			m_thread->Interrupt();
+			m_thread->Join();
+			//------------------------------------------------------------
+			m_log->Info("SAC activer has been stoped completely.");
+			//------------------------------------------------------------
+		}
+
+		//----------------------------------------------------------
+		private: System::Boolean CheckProcessExist()
+		{
+			Process^ currentProcess = Process::GetCurrentProcess();
+			array<Process^>^ ProcessList() = Process::GetProcessesByName(currentProcess->ProcessName);
+			//Process^ ProcessList[] = Process::GetProcessesByName(currentProcess->ProcessName);
+			if( ProcessList->Length > 1 )
+				return true;
+			else
+				return false;
+		}
+
+	};
+}
+
+
